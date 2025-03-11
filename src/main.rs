@@ -52,7 +52,7 @@ fn read_prices() {
             println!("{}", line.unwrap());
         }
     } else {
-        println!("No cached data found.");
+        println!("File doesn't exist. No cached data found.");
     }
 }
 
