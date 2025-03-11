@@ -1,67 +1,11 @@
-use futures_util::StreamExt;
-use serde_json::Value;
-use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, Write};
-use std::path::Path;
-use std::time::Duration;
+use std::collections::HashMap;
+
+use crypt::{generate_keypair, sign_messg, verify_signature};
+use price::{cache_prices, read_prices};
 use tokio::sync::mpsc;
-use tokio_tungstenite::{connect_async, tungstenite::Message};
 
-const FILE_PATH: &str = "btc_price_data.txt";
-const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443/ws/btcusdt@trade";
-
-async fn cache_prices(times: u64) -> f64 {
-    let (ws_stream, _) = connect_async(BINANCE_WS_URL).await.unwrap();
-    let (mut _write, mut read) = ws_stream.split();
-
-    let mut prices = Vec::new();
-    for _ in 0..times {
-        if let Some(msg) = read.next().await {
-            if let Ok(Message::Text(text)) = msg {
-                // println!("Message from websocket {}", text);
-                if let Ok(json) = serde_json::from_str::<Value>(&text) {
-                    if let Some(price) = json["p"].as_str() {
-                        let price: f64 = price.parse().unwrap_or(0.0);
-                        // println!("Received price: {:.3}", price);
-                        prices.push(price);
-                    }
-                }
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-
-    let avg_price = prices.iter().sum::<f64>() / prices.len() as f64;
-    println!(
-        "Cache complete. The average USD price of BTC is: {:.4}",
-        avg_price
-    );
-
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(FILE_PATH)
-        .unwrap();
-    writeln!(file, "{:.4}", avg_price).unwrap();
-    for price in prices {
-        writeln!(file, "{:.4}", price).unwrap();
-    }
-    avg_price
-}
-
-fn read_prices() {
-    if Path::new(FILE_PATH).exists() {
-        let file = fs::File::open(FILE_PATH).unwrap();
-        let reader = io::BufReader::new(file);
-
-        for line in reader.lines() {
-            println!("{}", line.unwrap());
-        }
-    } else {
-        println!("File doesn't exist. No cached data found.");
-    }
-}
+mod crypt;
+mod price;
 
 #[tokio::main]
 async fn main() {
@@ -82,16 +26,25 @@ async fn main() {
 
             let mut handles = Vec::new();
 
-            // for Question 1 // cache_prices(times).await; 
+            // for Question 1 // cache_prices(times).await;
 
             // Question 2
             // Creating async tasks for 5 client process, and run join on task_futures to run simultaneously
             let (tx, mut rx) = mpsc::channel(32);
+            let mut map = HashMap::new();
 
-            for _ in 0..5 {
-                let txcopy: mpsc::Sender<_> = tx.clone();
+            for process_number in 0..5 {
+                let txcopy = tx.clone();
+                let pair = generate_keypair().unwrap();
+                let public_key_bytes = pair.0;
+                map.insert(process_number, public_key_bytes);
                 let handle = tokio::spawn(async move {
-                    txcopy.send(cache_prices(times).await).await.unwrap();
+                    let avg_price = cache_prices(times, process_number).await;
+                    let signed_messg = sign_messg(avg_price.to_string().as_bytes(), pair.1);
+                    txcopy
+                        .send((process_number, signed_messg, avg_price))
+                        .await
+                        .unwrap();
                 });
                 handles.push(handle);
             }
@@ -104,7 +57,15 @@ async fn main() {
                 while let Some(val) = rx.recv().await {
                     values.push(val);
                 }
-                let avg_price = values.iter().sum::<f64>() / values.len() as f64;
+                let agg_values: Vec<f64> = values
+                    .iter()
+                    .filter(|x| {
+                        verify_signature(x.2.to_string().as_bytes(), *map.get(&x.0).unwrap(), x.1)
+                            .unwrap()
+                    })
+                    .map(|x| x.2)
+                    .collect();
+                let avg_price = agg_values.iter().sum::<f64>() / values.len() as f64;
                 println!(
                     "FINAL AVERAGE received from all client processes: {}",
                     avg_price
